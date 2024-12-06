@@ -1,82 +1,131 @@
-//set up logic for the IR sensor
-const int sensorPin = A0;  
+#include <Servo.h>
+#include <WiFiNINA.h>
+#include <ArduinoMqttClient.h>
+
+// Reconnect parameters
+const int maxAttempts = 5;
+int reconnectAttempts = 0;
+unsigned long lastReconnectAttempt = 0; 
+const long reconnectInterval = 1000;
+
+// WiFi credentials
+const char ssid[] = "BU Guest (unencrypted)";
+
+// MQTT settings
+const char broker[] = "10.193.180.134";
+const int port = 1883;
+const char topic[] = "lift_data";
+const char servo_topic[] = "servoMotor";
+
+WiFiClient wifiClient;
+MqttClient mqttClient(wifiClient);
+
+const int sensorPin = A0;
+const int servoPin = 9;
+
+Servo myservo;
 float distanceCM;
 unsigned long startTime;
 
-//set up logic for the button
-const int buttonPin = 2;
-bool buttonPressed = false; 
-bool lastButtonState = false; //previous button state for debouncing
-
-float distanceSum = 0; 
-int distanceCount = 0; 
-
-unsigned long lastDebounceTime = 0;
-unsigned long debounceDelay = 50; //ms 
-
 void setup() {
   Serial.begin(9600);
-  pinMode(buttonPin, INPUT_PULLUP); //set up button as input. IR sensor doens't have to be an input since serial ports are already inputs. 
+  myservo.attach(servoPin);
+  myservo.write(0);
+  
+  Serial.print("Connecting to WiFi");
+  while (WiFi.begin(ssid) != WL_CONNECTED) {
+    Serial.print(".");
+    delay(5000);
+  }
+  Serial.println("\nConnected to WiFi");
 
+  if (!mqttClient.connect(broker, port)) {
+    Serial.print("MQTT connection failed! Error code = ");
+    Serial.println(mqttClient.connectError());
+    return;
+  }
+  
+  Serial.println("Connected to MQTT broker");
+  mqttClient.subscribe(servo_topic);
   startTime = millis();
-
-  Serial.println("IR Distance Sensor Monitoring Started...");
-  Serial.println("Time (s)\tVoltage (V)\tDistance (cm)"); 
 }
 
 void loop() {
+  mqttClient.poll();
+
+  // Read sensor and send data continuously
   int sensorValue = analogRead(sensorPin);
-
-  //convert analog value to voltage
-  const float analogReferenceVoltage = 5.0;
-  float voltage = sensorValue * (analogReferenceVoltage / 1023.0);
-
-  //calculate the distance based on the sensor value
   distanceCM = analogToDistance(sensorValue);
+  // Serial.print("Time: ");
+  // Serial.print(String((millis() - startTime)) );
+  // Serial.print(" s, Distance: ");
+  // Serial.print(distanceCM);
+  // Serial.println(" cm");
+  
+  // Send data via MQTT
+  String message = "{\"time\":" + String((millis() - startTime)) 
+                + ",\"distance\":" + String(distanceCM) + "}";
+  
+  mqttClient.beginMessage(topic);
+  mqttClient.print(message);
+  mqttClient.endMessage();
 
-  //read the current button state
-  bool reading = !digitalRead(buttonPin); //true when pressed
+  // Handle incoming servo commands
+  int messageSize = mqttClient.parseMessage();
+  if (messageSize) {
+    String incomingTopic = mqttClient.messageTopic();
+    String payload = mqttClient.readString();
+    
+    // Trim whitespace and newlines
+    payload.trim();
+    
+    Serial.println("Debug MQTT Message:");
+    Serial.print("Topic: '");
+    Serial.print(incomingTopic);
+    Serial.println("'");
+    Serial.print("Payload: '");
+    Serial.print(payload);
+    Serial.println("'");
+    
+    // Use equals() for string comparison
+    if (incomingTopic.equals("servoMotor")) {
+        if (payload.equals("HIGH")) {
+            Serial.println("Matched HIGH - Setting Servo to 180");
+            myservo.write(180);
+        } 
+        else if (payload.equals("LOW")) {
+            Serial.println("Matched LOW - Setting Servo to 0");
+            myservo.write(0);
+        }
+        else {
+            Serial.print("Unrecognized payload: '");
+            Serial.print(payload);
+            Serial.println("'");
+            // Print ASCII values for debugging
+            for (int i = 0; i < payload.length(); i++) {
+                Serial.print((int)payload[i]);
+                Serial.print(" ");
+            }
+            Serial.println();
+        }
+    }
+}
 
-  //debounce logic
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
-
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading != buttonPressed) {
-      buttonPressed = reading;
-
-      if (buttonPressed) {
-        //button was just pressed
-        distanceSum = 0;
-        distanceCount = 0;
-      } else {
-        //button was just released
-        setCoords(); 
+  // Handle MQTT reconnection
+  if (!mqttClient.connected()) {
+    unsigned long now = millis();
+    if (now - lastReconnectAttempt > reconnectInterval) {
+      lastReconnectAttempt = now;
+      if (mqttClient.connect(broker, port)) {
+        mqttClient.subscribe(servo_topic);
+        Serial.println("Reconnected to MQTT broker");
       }
     }
   }
-
-  lastButtonState = reading;
-
-  if (buttonPressed) {
-    distanceSum += distanceCM;
-    distanceCount++;
-  }
-
-  //calculate the elapsed time since the program started
-  float elapsedTime = (millis() - startTime) / 1000.0;  // Convert to seconds
-
-  Serial.print(elapsedTime, 2);
-  Serial.print("\t");
-  Serial.print(voltage, 2);
-  Serial.print("\t");
-  Serial.print(distanceCM);
-  Serial.println(" cm");
+  
 
   delay(100);
 }
-
 // Function to convert analog value to distance (in cm)
 float analogToDistance(int analogValue) {
   const float analogReferenceVoltage = 5.0;
@@ -85,23 +134,9 @@ float analogToDistance(int analogValue) {
   float b = 1.2;
 
   if (voltage < 0.1) {
-    return 120.0; //return max distance if out of range. 
+    return 120.0; // Return max distance if out of range. 
   }
 
   float distance = pow(k / voltage, b);
   return distance;
-}
-
-void setCoords() {
-  if (distanceCount == 0) {
-    Serial.println("No data collected.");
-    return;
-  }
-
-  float y1 = distanceSum / distanceCount;
-  Serial.print("Y1 is calculated to be: ");
-  Serial.println(y1);
-
-  distanceSum = 0;
-  distanceCount = 0;
 }
