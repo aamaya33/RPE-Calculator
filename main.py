@@ -222,7 +222,7 @@ def analyze_lift(time_data, distance_data, rpe_threshold):
     try:
         if not mqtt_handler.connected:
             mqtt_handler.start()
-            time.sleep(10)  # Give time for arduino to connect
+            time.sleep(1)  # Give time for arduino to connect
             
         if mqtt_handler.connected:
             if rpe > rpe_threshold:
@@ -638,7 +638,7 @@ def main():
                 distance_data = mqtt_handler.data_buffer['distance'][:min_length]
 
                 #FIXME: Remove length argument
-                if check_acceleration_stop(distance_data) or len(time_data) > 100: #Data will continue showing on the terminal, but it won't be added to time_data or distance_data
+                if check_acceleration_stop(distance_data) or len(time_data) > 200: #Data will continue showing on the terminal, but it won't be added to time_data or distance_data
                     collecting = False
                     print("Data collection stopped.")
                     mqtt_handler.data_buffer = {'time': [], 'distance': []}
@@ -646,12 +646,21 @@ def main():
                     
             time.sleep(0.1)
         print("Analyzing data...")
+        # Filter the data so that we only analyze times after the button is pressed 
+        valid_indices = [i for i, t in enumerate(mqtt_data.time_data) if t >= start_time]
+    
+        # Filter both lists using the valid indices (if this doesn't work get rid of the next two lines and put time and distance as inputs for analysis)
+        filtered_time = [mqtt_data.time_data[i] for i in valid_indices]
+        filtered_distance = [mqtt_data.distance_data[i] for i in valid_indices]
+
         if len(time_data) > 5:  # Only analyze when we have enough data
-            analyze_lift(time_data, distance_data, rpe_threshold)
-            save_data(time_data, distance_data)
+            analyze_lift(filtered_time, filtered_distance, rpe_threshold)
+            save_data(filtered_time, filtered_distance)
+        else:
+            print("\nNot enough data to analyze. Please try again.\n")
         mqtt_handler.stop()
     except KeyboardInterrupt:
-        print("\nStopping data collection...")
+        print("\nStopping Program...")
         mqtt_handler.stop()
     finally:
         plt.close('all')
