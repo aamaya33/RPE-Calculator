@@ -1,3 +1,4 @@
+import os 
 import serial
 import time
 import json
@@ -5,6 +6,7 @@ import matplotlib.pyplot as plt
 from serial.serialutil import SerialException
 import numpy as np 
 from scipy.signal import find_peaks
+from MQTT import MQTTHandler
 
 def setup_serial(port: str = '/dev/cu.usbmodem1101', baud_rate: int = 9600) -> serial.Serial:
     """Initialize serial connection.
@@ -87,15 +89,24 @@ def calculate_rpe(time_data: list[float], distance_data: list[float], velocity_d
     peaks, _ = find_peaks(distance_data)
     valleys, _ = find_peaks([-x for x in distance_data])
     
-    lift_type = "bench" if len(valleys) == 1 else "deadlift"
+    if len(valleys) == 0 and len(peaks) == 0:
+        # If no clear peaks/valleys, use simple threshold
+        lift_type = "bench" if distance_data[0] > min(distance_data) else "deadlift"
+        if lift_type == "bench":
+            valley_idx = np.argmin(distance_data)
+        else:
+            peak_idx = np.argmax(distance_data)
+    else:
+        lift_type = "bench" if len(valleys) == 1 or distance_data[0] > min(distance_data) else "deadlift"
+
 
     if lift_type == "bench":
         # For bench, find the lowest point (valley) and take data after that
-        valley_idx = valleys[0]  # We know there's exactly one valley for bench
+        valley_idx = valleys[0] if len(valleys) > 0 else np.argmin(distance_data) # We know there's exactly one valley for bench
         ascent_velocity = velocity_data[valley_idx:]
     elif lift_type == "deadlift":
         # For deadlift, take data from start until first peak
-        peak_idx = peaks[0]  # First peak
+        peak_idx = peaks[0] if len(peaks) > 0 else np.argmax(distance_data)  # First peak
         ascent_velocity = velocity_data[:peak_idx]
 
     # Calculate average velocity for ascent portion only
@@ -103,8 +114,6 @@ def calculate_rpe(time_data: list[float], distance_data: list[float], velocity_d
     
     # Calculate metrics
     total_time = time_data[-1] - time_data[0]
-    #need to calculate average velocity, but only look at ascent for deads and bench 
-    avg_velocity = np.mean(velocity_data)
     
     # Find sticking points (periods of low velocity)
     sticking_threshold = 0.1 * max(velocity_data)  # 10% of max velocity
@@ -113,25 +122,28 @@ def calculate_rpe(time_data: list[float], distance_data: list[float], velocity_d
     
     # Base RPE calculation
     ascent_start, ascent_end = find_ascent_startEnd(distance_data, time_data)
-    if(lift_type == "bench" and ascent_end - ascent_start > 2):
+    if(lift_type == "bench" and ascent_end - ascent_start > 2 or lift_type == "deadlift" and ascent_end - ascent_start > 2.5):
         rpe = 7.5
     else: 
         rpe = 5.0
     
-    if((ascent_end - ascent_start > 2.5 and lift_type == "bench") or (ascent_end - ascent_start > 3.5 and lift_type == "deadlift")):
+    if((ascent_end - ascent_start > 3 and lift_type == "bench") or (ascent_end - ascent_start > 3.75 and lift_type == "deadlift")):
         rpe = 8.0
     # Time under tension factor
-    if total_time > 5.0:  # Longer lifts are harder cm/s
-        rpe += min(2.0, (total_time - 5.0))
+    if total_time > 7.0:  # Longer lifts are harder cm/s
+        rpe += min(1.0, (total_time - 5.0))
     
     # Velocity factors
     if avg_velocity < 7.5:  # slow
         rpe += 1.0
-    elif avg_velocity > 20:  # Fast/explosive
+    elif avg_velocity > 23:  # Fast/explosive
         rpe -= 1.0
+    # Noticed that avg velocity for deadlift is better, threshold is 17.5 for another 0.5 rpe 
+    if lift_type == "deadlift" and avg_velocity > 17.5:
+        rpe += 0.5
     
     # Sticking point factor
-    rpe += sticking_ratio * 1.5
+    rpe += sticking_ratio * 1.15
     
     # Adjust based on lift type
     if lift_type == "bench":
@@ -139,9 +151,9 @@ def calculate_rpe(time_data: list[float], distance_data: list[float], velocity_d
         rpe += sticking_ratio * 0.5
     
     # Clamp final RPE between 1-10
-    rpe = max(1.0, min(10.0, rpe))
+    rpe = max(1.0, min(10.0, round(rpe*2)/2))
     
-    return round(rpe, 1), lift_type
+    return round(rpe, 1), lift_type, avg_velocity, ascent_start, ascent_end
 #MARK: - Plot
 def plot_data(time_data: list[float], distance_data: list[float], rpe: float = None, lift_type: str = None) -> None:
     """Plot distance vs time graph with RPE information.
@@ -153,51 +165,83 @@ def plot_data(time_data: list[float], distance_data: list[float], rpe: float = N
         lift_type: Type of lift performed (optional)
     """
     plt.close('all')
-    ascent_start, ascent_end = find_ascent_startEnd(distance_data, time_data)
-    velocity_data = find_velocity(distance_data, time_data)
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    ax1.plot(time_data, distance_data)
-    if ascent_start and ascent_end:
-        ax1.axvline(x=ascent_start, color='r', linestyle='--', label='Ascent Start')
-        ax1.axvline(x=ascent_end, color='g', linestyle='--', label='Ascent End')
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Distance (cm)')
-    ax1.set_title('Distance vs. Time')
-    ax1.grid(True)
-    
-    # Add RPE and lift type info if provided
-    if rpe is not None and lift_type is not None:
-        info_text = f"Lift Type: {lift_type.capitalize()}\nRPE: {rpe}/10"
-        ax1.text(0.95, 0.95, info_text,
-                transform=ax1.transAxes,
-                verticalalignment='top',
-                horizontalalignment='right',
-                bbox=dict(facecolor='white', alpha=0.8))
-    
-    ax2.plot(time_data[1:], velocity_data)
-    if ascent_start and ascent_end:
-        ax2.axvline(x=ascent_start, color='r', linestyle='--', label='Ascent Start')
-        ax2.axvline(x=ascent_end, color='g', linestyle='--', label='Ascent End')
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Velocity (cm/s)')
-    ax2.set_title('Velocity vs. Time')
-    ax2.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    plt.close('all')
+    try:
+        ascent_start, ascent_end = find_ascent_startEnd(distance_data, time_data)
+        velocity_data = find_velocity(distance_data, time_data)
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        ax1.plot(time_data, distance_data)
+        if ascent_start and ascent_end:
+            ax1.axvline(x=ascent_start, color='r', linestyle='--', label='Ascent Start')
+            ax1.axvline(x=ascent_end, color='g', linestyle='--', label='Ascent End')
+        ax1.set_xlabel('Time (s)')
+        ax1.set_ylabel('Distance (cm)')
+        ax1.set_title('Distance vs. Time')
+        ax1.grid(True)
+        
+        # Add RPE and lift type info if provided
+        if rpe is not None and lift_type is not None:
+            info_text = f"Lift Type: {lift_type.capitalize()}\nRPE: {rpe}/10"
+            ax1.text(0.95, 0.95, info_text,
+                    transform=ax1.transAxes,
+                    verticalalignment='top',
+                    horizontalalignment='right',
+                    bbox=dict(facecolor='white', alpha=0.8))
+        
+        ax2.plot(time_data[1:], velocity_data)
+        if ascent_start and ascent_end:
+            ax2.axvline(x=ascent_start, color='r', linestyle='--', label='Ascent Start')
+            ax2.axvline(x=ascent_end, color='g', linestyle='--', label='Ascent End')
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Velocity (cm/s)')
+        ax2.set_title('Velocity vs. Time')
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"Error plotting data: {e}")
+    finally: 
+        plt.close('all')
 
-def analyze_lift(time_data, distance_data):
-    velocity_data = find_velocity(distance_data, time_data)
+def analyze_lift(time_data, distance_data, rpe_threshold):
+    """Analyze and plot lift data. 
 
-    rpe, lift_type = calculate_rpe(time_data, distance_data, velocity_data)
+    Args:
+        time_data: list of time measurements
+        distance_data: list of distance measurements
+        rpe_threshold: RPE threshold for lift analysis
+    
+    """
+    velocity_data = find_velocity(distance_data, time_data)
+    mqtt_handler = MQTTHandler()
+    
+
+    rpe, lift_type, average_velocity, ascent_start, ascent_end = calculate_rpe(time_data, distance_data, velocity_data)
+    try:
+        if not mqtt_handler.connected:
+            mqtt_handler.start()
+            time.sleep(1)  # Give time for arduino to connect
+            
+        if mqtt_handler.connected:
+            if rpe > rpe_threshold:
+                print("RPE is too high, activating servo")
+                mqtt_handler.publish("servoMotor", "HIGH")
+            else:
+                mqtt_handler.publish("servoMotor", "LOW")
+        else:
+            print("Cannot control servo - MQTT not connected")
+            
+    except Exception as e:
+        print(f"Error controlling servo: {e}")
+    mqtt_handler.stop()
     print(f"\nLift Analysis:")
     print(f"Lift Type: {lift_type.capitalize()}")
     print(f"Estimated RPE: {rpe}/10")
     print(f"Total Time: {time_data[-1] - time_data[0]:.2f} s")
-    print(f"Average Velocity: {np.mean(velocity_data):.2f} cm/s")
+    print(f"Average Velocity: {average_velocity:.2f} cm/s")
+    print(f"Time under tension: {ascent_end - ascent_start:.2f} s")
     plot_data(time_data, distance_data, rpe, lift_type)
 
 def save_data(time_data: list[float], distance_data: list[float], filename: str = 'LifterData.json') -> None:
@@ -208,11 +252,14 @@ def save_data(time_data: list[float], distance_data: list[float], filename: str 
         distance_data: list of distance measurements
         filename: Output JSON filename
     """
+    desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+    filepath = os.path.join(desktop_path, filename)
+
     data = {'time': time_data, 'distance': distance_data}
     try:
-        with open(filename, 'w') as f:
+        with open(filepath, 'w') as f:
             json.dump(data, f)
-        print(f"Data saved to {filename}")
+        print(f"Data saved to {filepath}")
     except IOError as e:
         print(f"Error saving data: {e}")
 
@@ -253,18 +300,18 @@ def find_ascent_startEnd(distance_data, time_data) -> tuple[int, int]:
     ascent_end = local_max_idx + ascent_start
     
     return time_data[ascent_start], time_data[ascent_end]
-#MARK: - Main
-def main():
-    """Main program execution."""
-    try:
-        ser = setup_serial()
-        time_data, distance_data = collect_data(ser)
+
+def check_acceleration_stop(distance_data, time_window=3.0):
+    """Check if acceleration has been ~0 for given time window."""
+    if len(distance_data) < 30:  # Need enough data points
+        return False
         
-        if time_data and distance_data:
-            save_data(time_data, distance_data)
-            analyze_lift(time_data, distance_data)
-    except Exception as e:
-        print(f"Program error: {e}")
+    # Calculate acceleration from distance data
+    acceleration = np.diff(np.diff(distance_data[-30:]))
+    
+    # Check if acceleration near zero for last 3 seconds
+    threshold = 0.001  # Adjust based on your sensor sensitivity
+    return all(abs(a) < threshold for a in acceleration[-int(30 * time_window/3):])
 #MARK: - Test
 def test_rpe_calculator():
     # Sample data from the table
@@ -411,8 +458,214 @@ def test_rpe_calculator():
     90.26064, 90.27179, 90.36981, 90.37271, 90.43570, 90.53524, 90.54871, 90.43362,
     89.90338, 88.69367, 86.55269, 83.24911
     ]
-    analyze_lift(time_dataD2, distance_dataD2)
 
+    time_dataB4 = [
+    9.433333, 9.466667, 9.500000, 9.533333, 9.566667, 9.600000, 9.633333, 9.666667,
+    9.700000, 9.733333, 9.766667, 9.800000, 9.833333, 9.866667, 9.900000, 9.933333,
+    9.966667, 10.000000, 10.033333, 10.066667, 10.100000, 10.133333, 10.166667, 10.200000,
+    10.233333, 10.266667, 10.300000, 10.333333, 10.366667, 10.400000, 10.433333, 10.466667,
+    10.500000, 10.533333, 10.566667, 10.600000, 10.633333, 10.666667, 10.700000, 10.733333,
+    10.766667, 10.800000, 10.833333, 10.866667, 10.900000, 10.933333, 10.966667, 11.000000,
+    11.033333, 11.066667, 11.100000, 11.133333, 11.166667, 11.200000, 11.233333, 11.266667,
+    11.300000, 11.333333, 11.366667, 11.400000, 11.433333, 11.466667, 11.500000, 11.533333,
+    11.566667, 11.600000, 11.633333, 11.666667, 11.700000, 11.733333, 11.766667, 11.800000,
+    11.833333, 11.866667, 11.900000, 11.933333, 11.966667, 12.000000, 12.033333, 12.066667,
+    12.100000, 12.133333, 12.166667, 12.200000, 12.233333, 12.266667, 12.300000, 12.333333,
+    12.366667, 12.400000, 12.433333, 12.466667, 12.500000, 12.533333, 12.566667, 12.600000,
+    12.633333, 12.666667, 12.700000, 12.733333, 12.766667, 12.800000, 12.833333, 12.866667,
+    12.900000, 12.933333, 12.966667, 13.000000, 13.033333, 13.066667, 13.100000, 13.133333,
+    13.166667, 13.200000, 13.233333, 13.266667, 13.300000, 13.333333, 13.366667, 13.400000,
+    13.433333, 13.466667, 13.500000, 13.533333, 13.566667, 13.600000, 13.633333, 13.666667,
+    13.700000, 13.733333, 13.766667, 13.800000, 13.833333, 13.866667, 13.900000, 13.933333,
+    13.966667, 14.000000, 14.033333, 14.066667, 14.100000, 14.133333, 14.166667, 14.200000,
+    14.233333, 14.266667, 14.300000, 14.333333, 14.366667, 14.400000, 14.433333, 14.466667,
+    14.500000, 14.533333, 14.566667, 14.600000
+    ]
+
+    distance_dataB4 = [
+    98.45000, 98.28552, 98.11344, 98.04734, 97.95734, 97.94272, 97.93484, 97.94889,
+    97.93901, 98.06695, 98.01151, 97.99786, 97.83473, 97.74190, 97.71493, 97.82161,
+    97.89549, 98.01053, 98.10935, 98.24388, 98.27144, 98.22903, 98.13374, 98.06597,
+    97.99176, 97.93344, 97.89666, 97.92315, 97.94555, 97.94112, 97.90426, 97.85155,
+    97.76819, 97.58635, 97.40967, 97.18759, 96.91254, 96.59550, 95.96458, 95.03102,
+    93.50938, 91.66972, 89.58095, 86.92328, 84.16757, 81.03350, 77.85210, 74.69326,
+    71.33591, 68.08329, 64.75830, 61.38540, 58.16718, 54.89820, 52.15188, 49.23046,
+    46.65529, 44.23495, 41.91164, 39.79274, 37.74440, 35.99382, 34.45205, 33.21221,
+    32.22528, 31.53183, 31.20744, 30.92941, 30.97896, 31.01503, 31.15840, 31.27350,
+    31.39801, 31.41809, 31.43934, 31.39188, 31.41722, 31.37738, 31.41799, 31.51578,
+    31.59807, 31.75206, 31.92953, 32.27223, 32.76462, 33.47711, 34.33508, 35.28136,
+    36.31034, 37.52542, 38.81378, 40.17010, 41.50134, 42.93970, 44.37317, 45.79295,
+    47.09876, 48.41413, 49.72995, 51.09672, 52.18662, 53.34497, 54.42442, 55.53308,
+    56.64611, 57.69032, 58.70046, 59.64953, 60.64692, 61.64533, 62.65312, 63.58665,
+    64.59393, 65.55237, 66.57866, 67.46057, 68.31111, 69.16931, 69.88128, 70.59772,
+    71.23542, 71.90910, 72.62932, 73.31173, 73.93996, 74.66109, 75.36854, 76.13904,
+    76.86075, 77.65669, 78.39602, 79.24672, 80.05577, 80.87842, 81.78743, 82.69322,
+    83.54597, 84.43093, 85.29433, 86.11023, 87.01602, 87.96816, 89.07732, 90.21744,
+    91.43488, 92.85162, 94.39351, 96.08081, 97.78255, 99.31664, 100.14130, 100.50560,
+    100.54830, 100.20930, 99.71041, 99.48242
+    ]
+
+    time_dataB5 = [
+    0.000, 0.03333, 0.06667, 0.100, 0.133, 0.167, 0.200, 0.233, 0.267, 0.300,
+    0.333, 0.367, 0.400, 0.433, 0.467, 0.500, 0.533, 0.567, 0.600, 0.633,
+    0.667, 0.700, 0.733, 0.767, 0.800, 0.833, 0.867, 0.900, 0.933, 0.967,
+    1.000, 1.033, 1.067, 1.100, 1.133, 1.167, 1.200, 1.233, 1.267, 1.300,
+    1.333, 1.367, 1.400, 1.433, 1.467, 1.500, 1.533, 1.567, 1.600, 1.633,
+    1.667, 1.700, 1.733, 1.767, 1.800, 1.833, 1.867, 1.900, 1.933, 1.967,
+    2.000, 2.033, 2.067, 2.100, 2.133, 2.167, 2.200, 2.233, 2.267, 2.300,
+    2.333, 2.367, 2.400, 2.433, 2.467, 2.500, 2.533, 2.567, 2.600, 2.633,
+    2.667, 2.700, 2.733, 2.767, 2.800, 2.833, 2.867, 2.900, 2.933, 2.967,
+    3.000, 3.033, 3.067, 3.100, 3.133, 3.167, 3.200, 3.233, 3.267, 3.300,
+    3.333, 3.367, 3.400, 3.433, 3.467, 3.500, 3.533, 3.567, 3.600, 3.633,
+    3.667, 3.700, 3.733, 3.767, 3.800, 3.833, 3.867, 3.900, 3.933, 3.967,
+    4.000, 4.033, 4.067, 4.100, 4.133, 4.167, 4.200, 4.233, 4.267, 4.300,
+    4.333, 4.367, 4.400, 4.433, 4.467, 4.500, 4.533, 4.567, 4.600, 4.633,
+    4.667, 4.700, 4.733, 4.767, 4.800, 4.833, 4.867, 4.900, 4.933, 4.967,
+    5.000, 5.033, 5.067
+    ]
+
+    distance_dataB5 = [
+        54.3, 54.2, 54.2, 54.1, 53.7, 53.2, 52.5, 51.7, 50.9, 50.1,
+        49.2, 48.4, 47.4, 46.5, 45.6, 44.6, 43.6, 42.6, 41.8, 40.8,
+        39.9, 38.9, 38.1, 37.1, 36.2, 35.4, 34.6, 34.0, 33.2, 32.6,
+        32.0, 31.2, 29.7, 29.8, 29.3, 29.4, 29.2, 29.0, 29.0, 29.0,
+        29.0, 29.0, 29.0, 29.0, 29.0, 29.0, 29.0, 29.0, 29.0, 29.2,
+        29.4, 29.4, 29.6, 29.5, 29.7, 30.3, 31.2, 31.6, 32.0, 32.4,
+        32.8, 33.0, 33.4, 33.6, 34.0, 34.2, 34.4, 34.6, 34.8, 34.9,
+        35.1, 35.3, 35.6, 35.7, 35.9, 36.1, 36.4, 36.5, 36.8, 36.9,
+        37.1, 37.3, 37.5, 37.6, 37.7, 37.9, 38.1, 38.3, 38.5, 38.7,
+        38.9, 39.1, 39.3, 39.5, 39.6, 39.7, 39.9, 40.1, 40.3, 40.5,
+        40.7, 40.9, 40.9, 41.1, 41.3, 41.5, 41.6, 41.8, 42.0, 42.2,
+        42.4, 42.6, 42.8, 43.0, 43.2, 43.4, 43.6, 43.8, 44.0, 44.2,
+        44.4, 44.6, 44.8, 45.1, 45.3, 45.6, 45.8, 46.1, 46.4, 46.8,
+        47.2, 47.6, 48.0, 48.5, 49.0, 49.5, 50.1, 50.7, 51.4, 52.1,
+        52.7, 53.5, 54.1, 54.3, 54.5, 54.4, 54.3, 54.2, 54.2, 54.2,
+        54.2, 54.2, 54.2
+    ]
+
+    time_dataD3 = [
+        1.433333, 1.466667, 1.500000, 1.533333, 1.566667, 1.600000, 1.633333, 1.666667,
+        1.700000, 1.733333, 1.766667, 1.800000, 1.833333, 1.866667, 1.900000, 1.933333,
+        1.966667, 2.000000, 2.033333, 2.066667, 2.100000, 2.133333, 2.166667, 2.200000,
+        2.233333, 2.266667, 2.300000, 2.333333, 2.366667, 2.400000, 2.433333, 2.466667,
+        2.500000, 2.533333, 2.566667, 2.600000, 2.633333, 2.666667, 2.700000, 2.733333,
+        2.766667, 2.800000, 2.833333, 2.866667, 2.900000, 2.933333, 2.966667, 3.000000,
+        3.033333, 3.066667, 3.100000, 3.133333, 3.166667, 3.200000, 3.233333, 3.266667,
+        3.300000, 3.333333, 3.366667, 3.400000, 3.433333, 3.466667, 3.500000, 3.533333,
+        3.566667, 3.600000, 3.633333, 3.666667, 3.700000, 3.733333, 3.766667, 3.800000,
+        3.833333, 3.900000, 3.933333, 4.000000, 4.033333, 4.066667, 4.100000, 4.133333,
+        4.166667, 4.200000, 4.233333, 4.266667, 4.300000, 4.333333, 4.366667, 4.400000,
+        4.433333
+    ]
+
+
+
+    distance_dataD3 = [
+        55.47127, 55.72363, 55.87127, 55.97207, 56.15722, 56.28918, 56.49608, 56.69378,
+        56.79403, 56.95904, 57.10612, 57.29765, 57.39600, 57.59598, 57.79267, 58.05564,
+        58.34827, 58.61041, 59.02482, 59.48524, 59.94237, 60.48288, 61.10867, 61.80809,
+        62.47563, 63.24230, 64.12682, 65.05456, 66.09949, 67.08247, 68.24963, 69.04654,
+        70.14189, 71.41792, 72.51147, 73.79211, 75.06223, 76.31363, 77.64325, 79.07369,
+        80.41826, 81.96715, 83.33277, 84.70190, 86.06679, 87.59418, 88.94667, 90.05253,
+        90.99310, 92.02723, 92.86307, 93.36580, 93.78471, 94.19338, 94.52490, 94.75691,
+        95.01865, 95.29733, 95.50949, 95.78316, 96.14980, 96.01023, 96.88193, 96.72118,
+        97.95751, 98.23941, 98.49621, 98.66279, 98.80547, 98.94128, 99.04144, 99.11627,
+        99.19248, 99.20637, 99.00202, 99.31536, 99.39498, 99.45813, 99.62829, 98.97698,
+        100.99550, 100.45520, 100.29470, 100.29500, 100.21890, 99.86885, 99.23995, 97.99184, 97.99184
+    ]
+
+    time_dataD4 = [
+        32.56667, 32.60000, 32.63333, 32.66667, 32.70000, 32.73333, 32.76667, 32.80000,
+        32.83333, 32.86667, 32.90000, 32.93333, 32.96667, 33.00000, 33.03333, 33.06667,
+        33.10000, 33.13333, 33.16667, 33.20000, 33.23333, 33.26667, 33.30000, 33.33333,
+        33.36667, 33.40000, 33.43333, 33.46667, 33.50000, 33.53333, 33.56667, 33.60000,
+        33.63333, 33.66667, 33.70000, 33.73333, 33.76667, 33.80000, 33.83333, 33.86667,
+        33.90000, 33.93333, 33.96667, 34.00000, 34.03333, 34.06667, 34.10000, 34.13333,
+        34.16667, 34.20000, 34.23333, 34.26667, 34.30000, 34.33333, 34.36667, 34.40000,
+        34.43333, 34.46667, 34.50000, 34.53333, 34.56667, 34.60000, 34.63333, 34.66667,
+        34.70000, 34.73333, 34.76667, 34.80000, 34.83333, 34.86667, 34.90000, 34.93333,
+        34.96667, 35.00000, 35.03333, 35.06667, 35.10000, 35.13333, 35.16667, 35.20000,
+        35.23333, 35.26667, 35.30000, 35.33333, 35.36667, 35.40000, 35.43333, 35.46667,
+        35.50000, 35.53333, 35.56667, 35.60000, 35.63333, 35.66667, 35.70000, 35.73333,
+        35.76667, 35.80000, 35.83333, 35.86667, 35.90000, 35.93333, 35.96667, 36.00000
+    ]
+
+    distance_dataD4 = [
+        54.69487, 54.77368, 54.74549, 54.78717, 54.82117, 54.77329, 54.84831, 54.99828,
+        55.03895, 55.14323, 55.14421, 55.34602, 55.46808, 55.50659, 55.80978, 55.84957,
+        56.23027, 56.48137, 56.86313, 57.22825, 57.83644, 57.97789, 58.00011, 58.07890,
+        58.15657, 58.26422, 58.43667, 58.53828, 58.61084, 58.70838, 58.82079, 59.05616,
+        59.22084, 59.50895, 59.74966, 59.85370, 59.96359, 60.12338, 60.28859, 60.37462,
+        60.43692, 60.46362, 60.59307, 60.78167, 60.97854, 61.10512, 61.19449, 61.27291,
+        61.43937, 61.58855, 61.58642, 61.74232, 61.80416, 61.91716, 62.02709, 62.17424,
+        62.21835, 62.34878, 62.53151, 62.59848, 62.64273, 62.72076, 62.81885, 62.91303,
+        62.94469, 63.01938, 63.05350, 63.09573, 63.14455, 63.21416, 63.28366, 63.41924,
+        63.52613, 63.58623, 63.68467, 63.78468, 63.86078, 63.99977, 64.01235, 64.09558,
+        64.09077, 64.14479, 64.23250, 64.27712, 64.33016, 64.44738, 64.48655, 64.58570
+    ]
+
+
+    print(len(time_dataD4), len(distance_dataD4))
+    analyze_lift(time_dataD3, distance_dataD3)
+
+
+#MARK: - Main
+def main():
+    """Main program execution."""
+    mqtt_handler = MQTTHandler() #FIXME: Make it so that it can take more data in once the button is in the pressed state
+    time_data = []
+    distance_data = []
+    
+    # Get RPE threshold from user
+    rpe_threshold = float(input("Enter RPE threshold (1-10): "))
+    while not 1 <= rpe_threshold <= 10:
+        rpe_threshold = float(input("Invalid. Enter RPE threshold (1-10): "))
+    
+    try:
+        mqtt_handler.start()
+        print("Assume button has been pressed ...")
+        
+        collecting = True
+        print("Data collection started...")
+        while collecting:
+            # if mqtt_handler.button_pressed:  # Add button state to MQTTHandler
+            #     collecting = True
+            #     mqtt_handler.data_buffer = {'time': [], 'distance': []}
+            if collecting and len(mqtt_handler.data_buffer['time']) > 0:
+                min_length = min(len(mqtt_handler.data_buffer['time']), 
+                               len(mqtt_handler.data_buffer['distance']))          
+                time_data = mqtt_handler.data_buffer['time'][:min_length]
+                distance_data = mqtt_handler.data_buffer['distance'][:min_length]
+
+                #FIXME: Remove length argument
+                if check_acceleration_stop(distance_data) or len(time_data) > 200: #Data will continue showing on the terminal, but it won't be added to time_data or distance_data
+                    collecting = False
+                    print("Data collection stopped.")
+                    mqtt_handler.data_buffer = {'time': [], 'distance': []}
+                    mqtt_handler.stop()
+                    
+            time.sleep(0.1)
+        print("Analyzing data...")
+        # Filter the data so that we only analyze times after the button is pressed 
+        valid_indices = [i for i, t in enumerate(mqtt_data.time_data) if t >= start_time]
+    
+        # Filter both lists using the valid indices (if this doesn't work get rid of the next two lines and put time and distance as inputs for analysis)
+        filtered_time = [mqtt_data.time_data[i] for i in valid_indices]
+        filtered_distance = [mqtt_data.distance_data[i] for i in valid_indices]
+
+        if len(time_data) > 5:  # Only analyze when we have enough data
+            analyze_lift(filtered_time, filtered_distance, rpe_threshold)
+            save_data(filtered_time, filtered_distance)
+        else:
+            print("\nNot enough data to analyze. Please try again.\n")
+        mqtt_handler.stop()
+    except KeyboardInterrupt:
+        print("\nStopping Program...")
+        mqtt_handler.stop()
+    finally:
+        plt.close('all')
 
 if __name__ == "__main__":
-    test_rpe_calculator()
+    main()
+
+#run mosquitto with /usr/local/opt/mosquitto/sbin/mosquitto -c /usr/local/etc/mosquitto/etc/mosquitto/mosquitto.conf
