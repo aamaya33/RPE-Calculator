@@ -10,18 +10,12 @@ class MQTTHandler:
         self.client.on_message = self.on_message
         self.data_buffer: Dict[str, List[float]] = {'time': [], 'distance': []}
         self.connected = False
-        # self.button_pressed = True
-        self.last_message_time = time.time()
-        self.disconnect_timeout = 2.0
+        self.start_time = 0; 
         
     def on_connect(self, client, userdata, flags, rc):
         self.connected = True
         client.subscribe("lift_data")
-    
-    def check_connection_status(self):
-        if self.connected and (time.time() - self.last_message_time) > self.disconnect_timeout:
-            return True
-        return False
+        client.subscribe("start_time")
 
     def publish(self, topic: str, message: str):
         """Publish a message to specified MQTT topic"""
@@ -42,7 +36,6 @@ class MQTTHandler:
             return False
         
     def on_message(self, client, userdata, msg):
-        self.last_message_time = time.time()
         try:
             data = json.loads(msg.payload.decode())
             
