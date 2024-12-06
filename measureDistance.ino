@@ -22,6 +22,9 @@ MqttClient mqttClient(wifiClient);
 
 const int sensorPin = A0;
 const int servoPin = 9;
+const int buttonPin = 2; 
+int lastButtonState = LOW;
+
 
 Servo myservo;
 float distanceCM;
@@ -29,6 +32,7 @@ unsigned long startTime;
 
 void setup() {
   Serial.begin(9600);
+  
   myservo.attach(servoPin);
   myservo.write(0);
   
@@ -46,7 +50,8 @@ void setup() {
   }
   
   Serial.println("Connected to MQTT broker");
-  mqttClient.subscribe(servo_topic);
+  mqttClient.onMessage(onMqttMessage);
+  mqttClient.subscribe("servoMotor");
   startTime = millis();
 }
 
@@ -70,8 +75,55 @@ void loop() {
   mqttClient.print(message);
   mqttClient.endMessage();
 
+  int buttonState = digitalRead(buttonPin);
+  // Debounce logic is a little flawed, will be fixed in a different lifetime
+  if (buttonState != lastButtonState) {
+    if (buttonState == HIGH) {
+      Serial.println("Button pressed");
+      // Send MQTT message on button press
+
+      String jsonMessage = "{\"start_time\":" + String((millis() - startTime)/1000.0) + "}";
+      mqttClient.beginMessage("start_time");
+      mqttClient.print(jsonMessage);
+      mqttClient.endMessage();
+    }
+    delay(100);  
+  }
+  lastButtonState = buttonState;
   // Handle incoming servo commands
   int messageSize = mqttClient.parseMessage();
+
+  // Handle MQTT reconnection
+  if (!mqttClient.connected()) {
+    unsigned long now = millis();
+    if (now - lastReconnectAttempt > reconnectInterval) {
+      lastReconnectAttempt = now;
+      if (mqttClient.connect(broker, port)) {
+        mqttClient.subscribe(servo_topic);
+        Serial.println("Reconnected to MQTT broker");
+      }
+    }
+  }
+  
+
+  delay(100);
+}
+// Function to convert analog value to distance (in cm)
+float analogToDistance(int analogValue) {
+  const float analogReferenceVoltage = 5.0;
+  float voltage = analogValue * (analogReferenceVoltage / 1023.0);
+  float k = 27;  // Scaling constant
+  float b = 1.2;
+
+  if (voltage < 0.1) {
+    return 120.0; // Return max distance if out of range. 
+  }
+
+  float distance = pow(k / voltage, b);
+  return distance;
+}
+
+void onMqttMessage(int messageSize) {
   if (messageSize) {
     String incomingTopic = mqttClient.messageTopic();
     String payload = mqttClient.readString();
@@ -107,36 +159,7 @@ void loop() {
                 Serial.print(" ");
             }
             Serial.println();
+          }
         }
-    }
-}
-
-  // Handle MQTT reconnection
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - lastReconnectAttempt > reconnectInterval) {
-      lastReconnectAttempt = now;
-      if (mqttClient.connect(broker, port)) {
-        mqttClient.subscribe(servo_topic);
-        Serial.println("Reconnected to MQTT broker");
       }
-    }
-  }
-  
-
-  delay(100);
-}
-// Function to convert analog value to distance (in cm)
-float analogToDistance(int analogValue) {
-  const float analogReferenceVoltage = 5.0;
-  float voltage = analogValue * (analogReferenceVoltage / 1023.0);
-  float k = 27;  // Scaling constant
-  float b = 1.2;
-
-  if (voltage < 0.1) {
-    return 120.0; // Return max distance if out of range. 
-  }
-
-  float distance = pow(k / voltage, b);
-  return distance;
 }
