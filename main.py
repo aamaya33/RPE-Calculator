@@ -62,6 +62,15 @@ def collect_data(ser: serial.Serial) -> tuple[list[float], list[float]]:
     return time_data, distance_data
 
 def find_velocity(distance_data: list[float], time_data: list[float]) -> list[float]:
+    """Find velocity given the distance and time measurements.
+    
+    Args:
+        distance_data: List of distance measurements
+        velocity_data: List of velocity measurements
+        
+    Returns:
+        List of velocity points
+    """
     velocity_data = []
     for i in range(1, len(distance_data)):
         delta_d = distance_data[i] - distance_data[i-1]
@@ -281,6 +290,16 @@ def load_data(filename: str = 'data.json') -> tuple[list[float], list[float]]:
         return [], []
 #MARK: - Ascend
 def find_ascent_startEnd(distance_data, time_data) -> tuple[int, int]:
+    """ Finds where in the lift the barbell begins to go up (the ascent portion of the lift)
+    
+        Args:
+            time_data: List of time measurements
+            distance_data: List of distance measurements
+            velocity_data: List of velocity measurements
+        
+        Returns:
+            Tuple of (RPE score, lift type)
+    """
     # Calculate rate of change
     derivative = np.diff(distance_data)
     velocity_data = find_velocity(distance_data, time_data)
