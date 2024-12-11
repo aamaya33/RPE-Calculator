@@ -112,14 +112,21 @@ void loop() {
 float analogToDistance(int analogValue) {
   const float analogReferenceVoltage = 5.0;
   float voltage = analogValue * (analogReferenceVoltage / 1023.0);
-  float k = 27;  // Scaling constant
-  float b = 1.2;
-
-  if (voltage < 0.1) {
-    return 120.0; // Return max distance if out of range. 
+  float distance;
+  
+  // Segment 1: 0 < x < 10 cm
+  if (voltage <= 2.3) {
+    distance = (10.0 / 2.3) * voltage;
   }
-
-  float distance = pow(k / voltage, b);
+  // Segment 2: 10 < x < 15 cm
+  else if (voltage > 2.3 && voltage <= 2.3 + 0.09 * (15 - 10)) {
+    distance = ((voltage - 2.3) / 0.09) + 10.0;
+  }
+  // Segment 3: x > 15 cm
+  else {
+    distance = pow(30.07109709 / voltage, 1.0 / 0.8265);
+  }
+  
   return distance;
 }
 
